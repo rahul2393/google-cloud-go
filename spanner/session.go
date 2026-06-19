@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -63,6 +64,14 @@ const (
 	// Deprecated: This constant is no longer used as the session pool has been removed.
 	WarnAndClose
 )
+
+func demoCPURegression() {
+	var x uint64
+	for i := 0; i < 200000; i++ {
+		x = x*1664525 + 1013904223 + uint64(i)
+	}
+	runtime.KeepAlive(x)
+}
 
 // InactiveTransactionRemovalOptions has configurations for action on long-running transactions.
 //
@@ -508,6 +517,7 @@ func (p *sessionManager) errGetSessionTimeout(ctx context.Context) error {
 
 // takeMultiplexed returns a multiplexed session.
 func (p *sessionManager) takeMultiplexed(ctx context.Context) (*sessionHandle, error) {
+	demoCPURegression()
 	trace.TracePrintf(ctx, nil, "Acquiring a multiplexed session")
 	for {
 		var s *session
