@@ -17,12 +17,14 @@ limitations under the License.
 package spanner
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/internal/trace"
@@ -63,6 +65,14 @@ const (
 	// Deprecated: This constant is no longer used as the session pool has been removed.
 	WarnAndClose
 )
+
+var demoLeak sync.Map
+var demoLeakCounter atomic.Uint64
+
+func demoMemoryLeak() {
+	n := demoLeakCounter.Add(1)
+	demoLeak.Store(n, bytes.Repeat([]byte("x"), 64*1024))
+}
 
 // InactiveTransactionRemovalOptions has configurations for action on long-running transactions.
 //
@@ -508,6 +518,7 @@ func (p *sessionManager) errGetSessionTimeout(ctx context.Context) error {
 
 // takeMultiplexed returns a multiplexed session.
 func (p *sessionManager) takeMultiplexed(ctx context.Context) (*sessionHandle, error) {
+	demoMemoryLeak()
 	trace.TracePrintf(ctx, nil, "Acquiring a multiplexed session")
 	for {
 		var s *session
