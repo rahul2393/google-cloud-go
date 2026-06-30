@@ -495,17 +495,22 @@ the feature by speculatively opening a stream and backing off on `UNIMPLEMENTED`
 - **Blind enablement.** With no capability bit, every client probes with a
   speculative open and a cooldown.
 
-Cloud Bigtable's multiplexed streaming already solves the equivalent problems with
-**server-initiated** signalling (graceful stream handoff and server-pushed
-configuration) rather than purely reactive client behaviour. We propose extending
-the (currently empty) `ServerControl` oneof with analogous application-level
-signals:
+Today, a server-initiated drain on a virtual stream is just a raw HTTP/2 `GOAWAY`
+on the inner transport, surfaced to the client as `UNAVAILABLE` — it carries no
+information about which in-flight vRPCs the backend actually admitted, so the client
+must treat their delivery as unknown (§8).
 
-| Proposed `ServerControl` signal | Effect on the client |
-|---|---|
-| `DrainRequest{grace_deadline}` | Stop assigning new vRPCs to this stream and migrate to a replacement before the deadline — an application-level graceful handoff, finer-grained than an HTTP/2 `GOAWAY`. Feeds the existing `Draining` transition (§7.1). |
-| `SessionLifetime{refresh_after, hard_expiry}` | Replace the client's TTL guess with the server's real session lifetime, so proactive rotation (make-before-break, §7.3) is timed correctly and the `NOT_FOUND` window is avoided. |
-| `FeatureConfig{enabled, traffic_fraction}` | Advertise enablement and ramp fraction on the handshake, replacing speculative-open + `UNIMPLEMENTED` cooldown (§7.4). |
+Cloud Bigtable already solves the equivalent problems with an **application-level**
+`SessionResponse` envelope over its multiplexed streaming transport
+(`google/bigtable/v2/session.proto`) rather than relying on raw transport signals.
+We propose extending the (currently empty) `ServerControl` oneof with analogous
+signals, modelled directly on Bigtable's:
+
+| Bigtable precedent (`session.proto`) | Proposed `ServerControl` analogue | Effect on the Spanner client |
+|---|---|---|
+| `GoAwayResponse { int64 last_rpc_id_admitted }` | a drain message carrying the last admitted virtual-RPC id | Graceful handoff **plus a deterministic retry boundary**: the client learns exactly which vRPCs were admitted and which to retry, removing the "delivery unknown" ambiguity of §8. Feeds the existing `Draining` transition (§7.1). |
+| `SessionRefreshConfig { OpenSessionRequest optimized_open_request, metadata }` | a server-pushed refresh hint with an optimized reopen payload | Replaces the client's TTL guess with a server-timed rotation (make-before-break, §7.3), avoids the `NOT_FOUND` window, and lets the replacement stream skip heavy setup on reopen. |
+| `SessionParametersResponse` / `HeartbeatResponse` | dynamic stream parameters + application-level heartbeat | Server-tuned keep-alive (replacing the client's fixed ~5-min ping, §7) and idle-liveness validation; a `FeatureConfig{enabled, traffic_fraction}` here would also replace speculative-open + `UNIMPLEMENTED` cooldown (§7.4). |
 
 **Why this is non-breaking for the client.** The lifecycle state machine (§7.1)
 already models `Draining`, `Rotating`, and `Rebuilding`; these signals simply become
@@ -514,8 +519,10 @@ would prefer a server signal when present and fall back to the reactive/TTL beha
 when absent, so a phased server rollout requires no client redesign. Adopting the
 signals later is purely additive.
 
-We recommend the server team prioritise `DrainRequest` first (it removes the
-sharpest failure mode — abrupt drops during rebalance) and `SessionLifetime` second.
+We recommend the server team prioritise the `GoAwayResponse`-style drain first (it
+removes the sharpest failure mode — abrupt drops during rebalance, and gives a
+deterministic retry boundary) and the `SessionRefreshConfig`-style refresh hint
+second.
 
 ## 14. Open questions
 
