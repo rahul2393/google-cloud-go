@@ -20,9 +20,11 @@ Two facts shape everything below:
 1. A virtual RPC's backend is fixed when its **physical** stream is opened — an
    individual vRPC cannot be rerouted — so leader vs non-leader routing requires
    **two physical streams per channel**.
-2. The server exposes **no** control-plane signalling (the `ServerControl` message
-   is empty) and **no** capability advertisement, so stream lifecycle, refresh, and
-   feature enablement are entirely **client-driven**.
+2. The server today exposes **no** control-plane signalling (the `ServerControl`
+   message is empty) and **no** capability advertisement, so stream lifecycle,
+   refresh, and feature enablement are entirely **client-driven**. §13 proposes
+   adding server-driven signalling — as Cloud Bigtable already does for its
+   multiplexed streaming — which the design is structured to adopt without rework.
 
 ---
 
@@ -471,7 +473,51 @@ in one process.
 
 ---
 
-## 13. Open questions
+## 13. Proposal: server-driven lifecycle signalling
+
+> This section is a **proposal to the server team**, not part of the current
+> contract. The design above works without it; this describes a follow-up that
+> would remove client-side guesswork.
+
+Because `ServerControl` is empty, the client must drive refresh reactively (rotate
+on `NOT_FOUND`, rebuild on `Done`) and proactively on a TTL guess, and must enable
+the feature by speculatively opening a stream and backing off on `UNIMPLEMENTED`
+(§7). This has real costs:
+
+- **A reactive `NOT_FOUND` failure window.** The client learns the bound session is
+  gone only when a vRPC fails, so a burst of in-flight vRPCs fails before rotation
+  starts.
+- **No server-coordinated drain.** The server cannot ask a client to migrate off a
+  stream ahead of a backend rebalance or shutdown; the client only sees an abrupt
+  transport failure.
+- **TTL guesswork.** The client times session rotation on a fixed local interval
+  rather than the server's actual lifetime.
+- **Blind enablement.** With no capability bit, every client probes with a
+  speculative open and a cooldown.
+
+Cloud Bigtable's multiplexed streaming already solves the equivalent problems with
+**server-initiated** signalling (graceful stream handoff and server-pushed
+configuration) rather than purely reactive client behaviour. We propose extending
+the (currently empty) `ServerControl` oneof with analogous application-level
+signals:
+
+| Proposed `ServerControl` signal | Effect on the client |
+|---|---|
+| `DrainRequest{grace_deadline}` | Stop assigning new vRPCs to this stream and migrate to a replacement before the deadline — an application-level graceful handoff, finer-grained than an HTTP/2 `GOAWAY`. Feeds the existing `Draining` transition (§7.1). |
+| `SessionLifetime{refresh_after, hard_expiry}` | Replace the client's TTL guess with the server's real session lifetime, so proactive rotation (make-before-break, §7.3) is timed correctly and the `NOT_FOUND` window is avoided. |
+| `FeatureConfig{enabled, traffic_fraction}` | Advertise enablement and ramp fraction on the handshake, replacing speculative-open + `UNIMPLEMENTED` cooldown (§7.4). |
+
+**Why this is non-breaking for the client.** The lifecycle state machine (§7.1)
+already models `Draining`, `Rotating`, and `Rebuilding`; these signals simply become
+**additional triggers** for transitions the client already implements. The client
+would prefer a server signal when present and fall back to the reactive/TTL behaviour
+when absent, so a phased server rollout requires no client redesign. Adopting the
+signals later is purely additive.
+
+We recommend the server team prioritise `DrainRequest` first (it removes the
+sharpest failure mode — abrupt drops during rebalance) and `SessionLifetime` second.
+
+## 14. Open questions
 
 - Whether `resource-prefix`/`x-goog-request-params` must be duplicated on inner
   vRPCs for server-side audit, or the outer stream is authoritative for all inner
