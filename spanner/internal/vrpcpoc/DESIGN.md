@@ -79,14 +79,14 @@ sequenceDiagram
     participant FE as Cloud Frontend
     participant VC as Inner VirtualConn
 
-    App->>Phys: StartSessionCall(method, initReq, outer md)
-    Phys->>FE: open outer bidi stream (resource-prefix, route-to-leader, auth)
-    Note over App,VC: VirtualConn returned immediately; vRPCs may be sent before Ack
-    App-)VC: Control vRPC (InitRequest)
-    FE--)App: outer Header() ⇒ Ack
-    VC-)FE: ExecuteStreamingSql vRPC (session in request)
-    FE--)VC: PartialResultSet stream
-    Note over Phys,FE: stream terminates ⇒ Done fires
+    App->>Phys: StartSessionCall - method, initReq, outer md
+    Phys->>FE: open outer bidi stream - resource-prefix, route-to-leader, auth
+    Note over App,VC: VirtualConn returned immediately, vRPCs may be sent before Ack
+    App->>VC: Control vRPC - InitRequest
+    FE-->>App: outer Header returns, then Ack fires
+    VC->>FE: ExecuteStreamingSql vRPC - session in request
+    FE-->>VC: PartialResultSet stream
+    Note over Phys,FE: stream terminates, then Done fires
 ```
 
 ### 2.2 The service surface
@@ -215,7 +215,7 @@ new identity.
 flowchart TD
     A["Spanner API call"] --> B{"method virtual-eligible?"}
     B -- "session mgmt, Partition*, ExecuteBatchDml,<br/>BatchWrite, non-streaming Read" --> C["classic unary<br/>google.spanner.v1.Spanner"]
-    B -- "StreamingRead, ExecuteSql,<br/>ExecuteStreamingSql, BeginTransaction,<br/>Commit, Rollback" --> D{"feature enabled<br/>& not in cooldown?"}
+    B -- "StreamingRead, ExecuteSql,<br/>ExecuteStreamingSql, BeginTransaction,<br/>Commit, Rollback" --> D{"feature enabled<br/>and not in cooldown?"}
     D -- no --> C
     D -- yes --> E["route class from ctx<br/>(route-to-leader)"]
     E --> F{"a READY stream<br/>for (session, class)?"}
@@ -319,16 +319,16 @@ driven by a `NOT_FOUND` on a vRPC.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Dialing: pick (session, route-class) + concrete channel
-    Dialing --> Starting: StartSessionCall (outer md: resource-prefix + route)
-    Starting --> Ready: Ack (outer headers)
+    [*] --> Dialing: pick session, route-class, concrete channel
+    Dialing --> Starting: StartSessionCall with outer md resource-prefix and route
+    Starting --> Ready: Ack on outer headers
     note right of Starting: vRPCs may be sent before Ack
-    Ready --> Rotating: NOT_FOUND(5) — session deleted
-    Ready --> Rebuilding: Done / GOAWAY ⇒ UNAVAILABLE(14)
-    Ready --> Teardown: INTERNAL(13) — session-uri mismatch
-    Ready --> Rotating: client TTL (≈7-day refresh)
-    Rotating --> Draining: replacement streams Ready; routing flipped
-    Draining --> Closed: in-flight vRPCs + transactions finished
+    Ready --> Rotating: NOT_FOUND - session deleted
+    Ready --> Rebuilding: Done or GOAWAY maps to UNAVAILABLE
+    Ready --> Teardown: INTERNAL - session-uri mismatch
+    Ready --> Rotating: client TTL, about 7-day refresh
+    Rotating --> Draining: replacement streams Ready, routing flipped
+    Draining --> Closed: in-flight vRPCs and transactions finished
     Rebuilding --> Starting: reopen on the SAME session
     Teardown --> Closed
     Closed --> [*]
@@ -356,10 +356,10 @@ stops the world:
 flowchart LR
     A["new session ready<br/>(observer)"] --> B["open replacement streams<br/>on new session"]
     B --> C{"replacement READY?"}
-    C -- yes --> D["flip channel routing pointer<br/>new vRPCs → new streams"]
+    C -- yes --> D["flip channel routing pointer<br/>new vRPCs to new streams"]
     D --> E["old streams DRAINING"]
     E --> F["finish in-flight vRPCs + txns"]
-    F --> G["close old streams · retire old session"]
+    F --> G["close old streams, retire old session"]
 ```
 
 New requests use the old streams until their channel flips; only a request landing
