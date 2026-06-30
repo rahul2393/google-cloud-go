@@ -1,0 +1,485 @@
+/*
+ *
+ * Copyright 2026 gRPC authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+// Package vrpcsession is a local copy of the unreleased gRPC-Go
+// experimental/session package (client + server halves), embedded here so the
+// Spanner virtual-RPC (vRPC) proof-of-concept builds against stock gRPC without
+// an external module replace. It implements client-side support for Virtual RPCs:
+// multiplexing many virtual RPCs over a single physical gRPC bidirectional stream
+// ("HTTP/2-over-HTTP/2").
+//
+//  1. StartSessionCall initiates the physical stream and returns a Client with an
+//     active virtual ClientConn and an Ack channel for asynchronous handshake.
+//  2. streamConnAdapter wraps the physical gRPC stream and implements net.Conn.
+//  3. The virtual ClientConn dials over that adapter; virtual RPCs are serialized
+//     into frames transmitted as messages over the physical stream.
+package vrpcsession
+
+import (
+	"context"
+	"io"
+	"net"
+	"os"
+	"sync"
+	"time"
+
+	"fmt"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
+)
+
+// hybridCodec implements encoding.Codec to handle both proto.Message and []byte.
+type hybridCodec struct{}
+
+func (c hybridCodec) Marshal(v any) ([]byte, error) {
+	if b, ok := v.([]byte); ok {
+		return b, nil
+	}
+	if msg, ok := v.(proto.Message); ok {
+		return proto.Marshal(msg)
+	}
+	return nil, fmt.Errorf("session: unexpected type %T", v)
+}
+
+func (c hybridCodec) Unmarshal(data []byte, v any) error {
+	if b, ok := v.(*[]byte); ok {
+		*b = append((*b)[:0], data...)
+		return nil
+	}
+	if msg, ok := v.(proto.Message); ok {
+		return proto.Unmarshal(data, msg)
+	}
+	return fmt.Errorf("session: unexpected type %T", v)
+}
+
+func (c hybridCodec) Name() string {
+	return "proto"
+}
+
+// Client represents an active multiplexed session over a physical gRPC stream.
+type Client struct {
+	// VirtualConn is the fully functional HTTP/2-over-HTTP/2 channel.
+	VirtualConn *grpc.ClientConn
+
+	// Ack is closed or receives an error when the server sends initial metadata.
+	Ack <-chan error
+
+	// Done receives the final error context when the session stream terminates.
+	Done <-chan error
+}
+
+// StartSessionCall starts a generic BiDi session RPC and returns the Client.
+// virtualOpts are applied to the inner HTTP/2 virtual channel.
+// opts are applied to the outer session RPC.
+func StartSessionCall(ctx context.Context, cc *grpc.ClientConn, method string, req any, virtualOpts []grpc.DialOption, opts ...grpc.CallOption) (*Client, error) {
+	desc := &grpc.StreamDesc{
+		StreamName:    "Session",
+		ClientStreams: true,
+		ServerStreams: true,
+	}
+
+	hc := hybridCodec{}
+	opts = append([]grpc.CallOption{grpc.ForceCodec(hc)}, opts...)
+
+	ctx, cancel := context.WithCancel(ctx)
+	stream, err := cc.NewStream(ctx, desc, method, opts...)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	if err := stream.SendMsg(req); err != nil {
+		cancel()
+		return nil, err
+	}
+
+	adapter := newStreamConnAdapter(stream, cancel)
+	vcc, err := createVirtualChannel(adapter, virtualOpts...)
+	if err != nil {
+		adapter.shutdown(err)
+		return nil, err
+	}
+
+	ackCh := make(chan error, 1)
+	doneCh := make(chan error, 1)
+
+	go func() {
+		_, ackErr := stream.Header()
+		ackCh <- ackErr
+		close(ackCh)
+
+		if ackErr != nil {
+			adapter.shutdown(ackErr)
+			doneCh <- ackErr
+			close(doneCh)
+			return
+		}
+
+		<-adapter.closeCh
+
+		adapter.mu.Lock()
+		err := adapter.shutdownErr
+		adapter.mu.Unlock()
+		if err == nil {
+			err = stream.Context().Err()
+		}
+		doneCh <- err
+		close(doneCh)
+	}()
+
+	return &Client{
+		VirtualConn: vcc,
+		Ack:         ackCh,
+		Done:        doneCh,
+	}, nil
+}
+
+// streamInterface abstracts gRPC stream operations to support both client and server streams.
+type streamInterface interface {
+	RecvMsg(m any) error
+	SendMsg(m any) error
+}
+
+// streamConnAdapter wraps a physical gRPC stream to implement net.Conn.
+type streamConnAdapter struct {
+	stream  streamInterface
+	cancel  context.CancelFunc
+	readCh  chan []byte
+	writeCh chan []byte
+	currBuf []byte
+
+	mu            sync.Mutex
+	closed        bool
+	shutdownErr   error
+	readDeadline  time.Time
+	writeDeadline time.Time
+
+	readMu   sync.Mutex
+	streamMu sync.Mutex
+
+	closeCh      chan struct{}
+	shutdownOnce sync.Once
+	updateRead   chan struct{}
+	updateWrite  chan struct{}
+}
+
+func newStreamConnAdapter(stream streamInterface, cancel context.CancelFunc) *streamConnAdapter {
+	a := &streamConnAdapter{
+		stream:      stream,
+		cancel:      cancel,
+		readCh:      make(chan []byte, 16),
+		writeCh:     make(chan []byte, 16),
+		closeCh:     make(chan struct{}),
+		updateRead:  make(chan struct{}, 1),
+		updateWrite: make(chan struct{}, 1),
+	}
+	go a.pumpWrites()
+	go a.pumpReads()
+	return a
+}
+
+func (a *streamConnAdapter) shutdown(err error) {
+	a.shutdownOnce.Do(func() {
+		a.mu.Lock()
+		a.closed = true
+		a.shutdownErr = err
+		a.mu.Unlock()
+		close(a.closeCh)
+		if a.cancel != nil {
+			a.cancel()
+		}
+	})
+}
+
+func (a *streamConnAdapter) pumpReads() {
+	defer close(a.readCh)
+	for {
+		var msgBuf []byte
+		err := a.stream.RecvMsg(&msgBuf)
+		if err != nil {
+			a.shutdown(err)
+			break
+		}
+
+		a.mu.Lock()
+		closed := a.closed
+		a.mu.Unlock()
+
+		if closed {
+			break
+		}
+
+		select {
+		case a.readCh <- msgBuf:
+		case <-a.closeCh:
+			return
+		}
+	}
+}
+
+func (a *streamConnAdapter) pumpWrites() {
+	for {
+		select {
+		case msg, ok := <-a.writeCh:
+			if !ok {
+				return
+			}
+			a.streamMu.Lock()
+			err := a.stream.SendMsg(msg)
+			a.streamMu.Unlock()
+			if err != nil {
+				a.shutdown(err)
+				return
+			}
+		case <-a.closeCh:
+			return
+		}
+	}
+}
+
+type deadlineTimer struct {
+	timer *time.Timer
+}
+
+func (t *deadlineTimer) reset(deadline time.Time) (<-chan time.Time, error) {
+	if deadline.IsZero() {
+		if t.timer != nil && !t.timer.Stop() {
+			select {
+			case <-t.timer.C:
+			default:
+			}
+		}
+		return nil, nil
+	}
+	d := time.Until(deadline)
+	if d <= 0 {
+		return nil, os.ErrDeadlineExceeded
+	}
+	if t.timer == nil {
+		t.timer = time.NewTimer(d)
+	} else {
+		if !t.timer.Stop() {
+			select {
+			case <-t.timer.C:
+			default:
+			}
+		}
+		t.timer.Reset(d)
+	}
+	return t.timer.C, nil
+}
+
+func (t *deadlineTimer) stop() {
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+}
+
+func (a *streamConnAdapter) popCurrBuf(b []byte) int {
+	n := copy(b, a.currBuf)
+	if n < len(a.currBuf) {
+		a.currBuf = a.currBuf[n:]
+	} else {
+		a.currBuf = nil
+	}
+	return n
+}
+
+func (a *streamConnAdapter) Read(b []byte) (n int, err error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+
+	a.readMu.Lock()
+	defer a.readMu.Unlock()
+
+	var dt deadlineTimer
+	defer dt.stop()
+
+	for {
+		a.mu.Lock()
+		closed := a.closed
+		shutdownErr := a.shutdownErr
+		deadline := a.readDeadline
+		a.mu.Unlock()
+
+		if len(a.currBuf) == 0 && closed && len(a.readCh) == 0 {
+			if shutdownErr != nil && shutdownErr != io.EOF && shutdownErr != io.ErrClosedPipe {
+				return 0, shutdownErr
+			}
+			return 0, io.EOF
+		}
+
+		if len(a.currBuf) > 0 {
+			return a.popCurrBuf(b), nil
+		}
+
+		timerCh, err := dt.reset(deadline)
+		if err != nil {
+			return 0, err
+		}
+
+		select {
+		case msg, ok := <-a.readCh:
+			if !ok {
+				a.mu.Lock()
+				shutdownErr := a.shutdownErr
+				a.mu.Unlock()
+				if shutdownErr != nil && shutdownErr != io.EOF && shutdownErr != io.ErrClosedPipe {
+					return 0, shutdownErr
+				}
+				return 0, io.EOF
+			}
+			a.currBuf = msg
+			return a.popCurrBuf(b), nil
+		case <-timerCh:
+			return 0, os.ErrDeadlineExceeded
+		case <-a.updateRead:
+			continue
+		}
+	}
+}
+
+func (a *streamConnAdapter) Write(b []byte) (n int, err error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+
+	msg := make([]byte, len(b))
+	copy(msg, b)
+
+	var dt deadlineTimer
+	defer dt.stop()
+
+	for {
+		a.mu.Lock()
+		closed := a.closed
+		shutdownErr := a.shutdownErr
+		deadline := a.writeDeadline
+		a.mu.Unlock()
+
+		if closed {
+			if shutdownErr != nil && shutdownErr != io.ErrClosedPipe && shutdownErr != io.EOF {
+				return 0, shutdownErr
+			}
+			return 0, io.ErrClosedPipe
+		}
+
+		timerCh, err := dt.reset(deadline)
+		if err != nil {
+			return 0, err
+		}
+
+		select {
+		case a.writeCh <- msg:
+			return len(msg), nil
+		case <-timerCh:
+			return 0, os.ErrDeadlineExceeded
+		case <-a.closeCh:
+			a.mu.Lock()
+			shutdownErr := a.shutdownErr
+			a.mu.Unlock()
+			if shutdownErr != nil && shutdownErr != io.ErrClosedPipe && shutdownErr != io.EOF {
+				return 0, shutdownErr
+			}
+			return 0, io.ErrClosedPipe
+		case <-a.updateWrite:
+			continue
+		}
+	}
+}
+
+func (a *streamConnAdapter) Close() error {
+	a.shutdown(io.ErrClosedPipe)
+	a.streamMu.Lock()
+	defer a.streamMu.Unlock()
+	if cs, ok := a.stream.(interface{ CloseSend() error }); ok {
+		return cs.CloseSend()
+	}
+	return nil
+}
+
+func (a *streamConnAdapter) LocalAddr() net.Addr  { return addr{} }
+func (a *streamConnAdapter) RemoteAddr() net.Addr { return addr{} }
+
+func (a *streamConnAdapter) SetDeadline(t time.Time) error {
+	err1 := a.SetReadDeadline(t)
+	err2 := a.SetWriteDeadline(t)
+	if err1 != nil {
+		return err1
+	}
+	return err2
+}
+
+func (a *streamConnAdapter) SetReadDeadline(t time.Time) error {
+	a.mu.Lock()
+	a.readDeadline = t
+	a.mu.Unlock()
+
+	select {
+	case a.updateRead <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (a *streamConnAdapter) SetWriteDeadline(t time.Time) error {
+	a.mu.Lock()
+	a.writeDeadline = t
+	a.mu.Unlock()
+
+	select {
+	case a.updateWrite <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+type addr struct{}
+
+func (a addr) Network() string { return "virtual" }
+func (a addr) String() string  { return "virtual" }
+
+// createVirtualChannel initializes a grpc.ClientConn that dials over the adapter.
+func createVirtualChannel(adapter *streamConnAdapter, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	var dialed bool
+	var dialMu sync.Mutex
+
+	dialer := func(_ context.Context, _ string) (net.Conn, error) {
+		dialMu.Lock()
+		defer dialMu.Unlock()
+		if dialed {
+			return nil, net.ErrClosed
+		}
+		dialed = true
+		return adapter, nil
+	}
+
+	dialOpts := append([]grpc.DialOption{
+		grpc.WithContextDialer(dialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDisableServiceConfig(),
+		grpc.WithDisableHealthCheck(),
+		grpc.WithNoProxy(),
+		grpc.WithIdleTimeout(0),
+	}, opts...)
+
+	return grpc.NewClient("passthrough:///virtual_target", dialOpts...)
+}
