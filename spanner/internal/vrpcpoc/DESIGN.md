@@ -75,9 +75,9 @@ auth modules.
 ```mermaid
 sequenceDiagram
     participant App as Spanner client
-    participant Phys as Physical ClientConn (DCP entry)
+    participant Phys as Physical ClientConn / DCP entry
     participant FE as Cloud Frontend
-    participant VC as VirtualConn (inner)
+    participant VC as Inner VirtualConn
 
     App->>Phys: StartSessionCall(method, initReq, outer md)
     Phys->>FE: open outer bidi stream (resource-prefix, route-to-leader, auth)
